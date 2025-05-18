@@ -2,9 +2,12 @@
 title: "Functional genomic landscape of acute myeloid leukaemia"
 author: "Inês Lameira (PG40080), João Lima (PG55701), Romeu Fernandes (PG45861)"
 date: "`r Sys.Date()`"
-output: 
+output:
   html_document:
+    df_print: paged
     css: styles.css
+  pdf_document:
+    citation_package: biblatex
 bibliography: references.bib
 csl: nature.csl
 ---
@@ -26,31 +29,17 @@ No desenvolvimento deste trabalho foram vários os packages necessários para re
 #instalar os pacotes necessários
 #install.packages("ggplot2")
 #install.packages("DESeq2")
-#BiocManager::install(c("edgeR"),force =TRUE)
-#BiocManager::install(c("Glimma"))
-#BiocManager::install(c("gplots"))
-#BiocManager::install("org.Hs.eg.db")
-#BiocManager::install("fgsea")
 ```
 
 ```{r}
 # Carregar os pacotes necessários
 library(ggplot2)
+library(dplyr)
 library(tidyr)
 library(ggplot2)
 library(forcats)
 library(RColorBrewer)
 library(knitr)
-library(readr)
-library(edgeR)
-library(limma)
-library(pheatmap)
-library(Glimma)
-library(gplots)
-library(org.Hs.eg.db)
-library(BiocManager)
-library(dplyr)
-library(fgsea)
 ```
 
 ## Enquadramento
@@ -71,10 +60,6 @@ Este trabalho, inserido na unidade curricular de **Extração de Conhecimento de
 # Importação dos datasets
 dc_pacientes <- read.table("data_clinical_patient.txt", sep = "\t", header = TRUE)
 dc_amostras <- read.table("data_clinical_sample.txt", sep = "\t", header = TRUE, fill = TRUE)
-clinical_patient <- read.table("data_clinical_patient.txt", 
-                               header = TRUE, sep = "\t", stringsAsFactors = FALSE)
-RNASeq_rawcounts <- read.table("BeatAML_RNASeq_rawcounts_2018_10_24.csv",
-                               header = TRUE, sep = ",", stringsAsFactors = FALSE)
 ```
 
 # 1. Pacientes
@@ -665,339 +650,659 @@ ggplot(variancia_df, aes(x = Component, y = Variance_Proportion)) +
   theme_minimal()
 ```
 
-# 3. Análise de expressão diferencial
+# 3. Tratamento dos dados para realização de CLustering e Machine Learning
 
-A presente análise teve como objetivo investigar diferenças na expressão génica entre dois grupos de pacientes com leucemia mieloide aguda (LMA) do estudo BeatAML, com base no seu estado de sobrevivência: "LIVING" (vivos) e "DECEASED" (falecidos). Para tal, foram utilizados dados de RNA-Seq e aplicada uma análise de expressão diferencial com o pacote edgeR, específico para dados de contagens.
+## 3.0. Instalação de packages
 
-
-## 3.1 Preparação dos datasets
-
-Associação dos pacientes às amostras e ao estado de sobrevivência
 ```{r}
-SAMPLE <- dc_amostras %>% select(PATIENT_ID, SAMPLE_ID)
-PATIENT <- dc_pacientes %>% select(PATIENT_ID, OS_STATUS)
-PATIENT_F <- PATIENT %>%
-  filter(PATIENT_ID %in% SAMPLE$PATIENT_ID)
-PATIENT_F <- PATIENT[!apply(PATIENT, 1, function(x) any(is.na(x) | x == "")), ]
-SAMPLE_OSSTATUS <- merge(PATIENT_F, SAMPLE, by = "PATIENT_ID")
+install.packages("glmnet")
 ```
 
-Remover duplicados
+## 3.1. Pacotes Utilizados
+
 ```{r}
-SAMPLE_OSSTATUS_no_d <- SAMPLE_OSSTATUS %>%
-  distinct(PATIENT_ID, .keep_all = TRUE)
+# Carregar pacotes necessários
+library(dplyr)
+library(glmnet)
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(pROC)
+library(Rtsne)
+library(cluster)
+library(e1071)  # Para SVM
+library(nnet)  # Para Redes Neurais
+library(MASS)  # para stepAIC
 ```
 
-Formatação dos títulos das colunas
+## 3.2. Filtragem das linhas com status conhecido
 ```{r}
-colnames(RNASeq_rawcounts) <- colnames(RNASeq_rawcounts) |>
-  gsub("^X", "", x = _) |>
-  gsub("\\.", "-", x = _)
+# Filtrar dados clínicos para manter apenas as linhas com status conhecido (vivo ou falecido)
+pacientes <- dc_pacientes %>%
+  filter(OS_STATUS %in% c("1:DECEASED", "0:LIVING")) %>%
+  mutate(STATUS_BIN = ifelse(OS_STATUS == "1:DECEASED", 1, 0))
+
+head(pacientes)
 ```
 
-Remoção do prefixo da coluna SAMPLE_ID
+## 3.3. Tratamento de dados Pacientes e Amostras
 ```{r}
-
-
-SAMPLE_OSSTATUS_no_d$SAMPLE_ID <- gsub("^aml_ohsu_2018_", "", SAMPLE_OSSTATUS_no_d$SAMPLE_ID)
-```
-
-Remoção de amostras sem dados de expressão
-```{r}
-# IDs do RNASeq
-ids_rnaseq <- colnames(RNASeq_rawcounts)[10:ncol(RNASeq_rawcounts)]
-
-# IDs do SAMPLE_OSSTATUS_no_d (coluna SAMPLE_ID)
-ids_sample <- SAMPLE_OSSTATUS_no_d$SAMPLE_ID
-
-# IDs no RNASeq que NÃO estão no SAMPLE_OSSTATUS
-ids_only_rnaseq <- setdiff(ids_rnaseq, ids_sample)
-
-# IDs no SAMPLE_OSSTATUS que NÃO estão no RNASeq
-ids_only_sample <- setdiff(ids_sample, ids_rnaseq)
-
-# Mantém todas as colunas EXCETO as que estão em ids_to_remove_from_rnaseq
-RNASeq_filtrado <- RNASeq_rawcounts %>%
-  select(
-    -any_of(ids_only_rnaseq) 
+# Escolher colunas com <30% NAs e variância > 1
+pacientes <- pacientes %>%
+  filter(OS_STATUS %in% c("1:DECEASED", "0:LIVING")) %>%
+  mutate(STATUS_BIN = ifelse(OS_STATUS == "1:DECEASED", 1, 0)) %>%
+  dplyr::select(PATIENT_ID, STATUS_BIN, everything()) %>% # obriga a utilizar o dplyr, caso contrário gera conflito
+  dplyr::select(
+    PATIENT_ID,
+    STATUS_BIN,
+    where(~mean(is.na(.)) < 0.3),
+    where(~length(unique(na.omit(.))) > 1)
   )
 
-SAMPLE_OSSTATUS_filtrado <- SAMPLE_OSSTATUS_no_d %>%
-  filter(!SAMPLE_ID %in% ids_only_sample)
+amostras <- dc_amostras %>%
+  dplyr::select(PATIENT_ID, everything()) %>% # obriga a utilizar o dplyr, caso contrário gera conflito
+  dplyr::select(
+    PATIENT_ID,
+    where(~mean(is.na(.)) < 0.3),
+    where(~length(unique(na.omit(.))) > 1)
+  )
+
+# Manter apenas uma amostra por paciente
+amostras_unique <- amostras %>%
+  group_by(PATIENT_ID) %>%
+  slice(1) %>%
+  ungroup()
 ```
 
-Remoção dos metadados do RNA seq
+## 3.4. Filtragem por pacientes em comum
 ```{r}
-RNASeq_amostras <- RNASeq_filtrado %>% 
-  select(1, 10:ncol(RNASeq_filtrado))
+dados <- inner_join(amostras_unique, pacientes, by = "PATIENT_ID")
 ```
 
-## 3.2. Preparação da matriz de contagem para edgeR
-
+## 3.5. Limpeza dos Dados
 ```{r}
-#Configura a matriz de contagem com genes nas linhas e amostras nas colunas
-gene_names <- RNASeq_amostras[[1]]
+# Remover colunas com variância zero
+dados <- dados[, sapply(dados, function(x) length(unique(x)) > 1)]
 
-# Converter para matriz e definir rownames com nomes dos genes
-count_matrix <- as.matrix(RNASeq_amostras[, -1])
-rownames(count_matrix) <- gene_names
+# Remover linhas com NAs
+dados <- na.omit(dados)
+
+# Converte para fator 
+dados <- dados %>% mutate(across(where(is.character), as.factor))
+
+colunas_protegidas <- c("PATIENT_ID", "SAMPLE_ID")
+
+# Remover colunas com fenómenos raros
+colunas_a_remover <- sapply(names(dados), function(nome_coluna) {
+  col <- dados[[nome_coluna]]
+  if (is.factor(col) && !(nome_coluna %in% colunas_protegidas)) {
+    any(table(col) < 10)
+  } else {
+    FALSE
+  }
+})
+
+# Mostrar colunas com menos de 10 casos
+
+print(names(colunas_a_remover[colunas_a_remover]))
+
+dados <- dados[, !colunas_a_remover]
 ```
 
-
-Necessitamos de garantir que os tipos de dados estão corretos uma vez que o edgeR espera valores inteiros
+## 3.6. Divisão dos dados em conjunto de treino e teste
 ```{r}
-count_matrix <- round(as.matrix(count_matrix))
-mode(count_matrix) <- "integer"
+set.seed(123)
+idx <- sample(nrow(dados), 0.8 * nrow(dados))
+dados_treino <- dados[idx, ]
+dados_teste  <- dados[-idx, ]
 ```
 
-## 3.3. Preparação do grupo de amostras baseado no estado de sobrevivência
-
-Organização dos metadados na mesma ordem das colunas da matriz
+## 3.7. Sincronização de fatores
 ```{r}
-sample_info <- data.frame(
-  sample = colnames(count_matrix),
-  condition = SAMPLE_OSSTATUS_filtrado$OS_STATUS[match(colnames(count_matrix), 
-                                                       SAMPLE_OSSTATUS_filtrado$SAMPLE_ID)]
+# Remover colunas fator com apenas 1 nível no treino
+fatores_invalidos <- sapply(dados_treino, function(col) {
+  is.factor(col) && length(unique(col[!is.na(col)])) < 2
+})
+dados_treino <- dados_treino[, !fatores_invalidos]
+dados_teste  <- dados_teste[, names(dados_treino)]
+
+#Sincronizar níveis dos fatores entre treino e teste
+for (col in names(dados_treino)) {
+  if (is.factor(dados_treino[[col]])) {
+    lvls <- union(levels(dados_treino[[col]]), levels(dados_teste[[col]]))
+    dados_treino[[col]] <- factor(dados_treino[[col]], levels = lvls)
+    dados_teste[[col]]  <- factor(dados_teste[[col]], levels = lvls)
+  }
+}
+```
+
+# 4. Modelação Preditiva
+
+## 4.1. Regressão Logística
+
+### 4.1.1. Preparação dos dados
+
+```{r}
+# Remover colunas que não devem ser usadas como preditoras no modelo:
+# - Identificadores únicos (PATIENT_ID, SAMPLE_ID)
+# - Variáveis relacionadas com o desfecho (OS_STATUS, OS_MONTHS) para evitar fuga de informação
+
+dados_treino_model <- dados_treino %>%
+  dplyr::select(-PATIENT_ID, -SAMPLE_ID, -OS_STATUS, -OS_MONTHS)
+
+dados_teste_model <- dados_teste %>%
+  dplyr::select(-PATIENT_ID, -SAMPLE_ID, -OS_STATUS, -OS_MONTHS)
+```
+
+### 4.1.2. Regressão logística com regularização (LASSO)
+
+A regressão LASSO permite selecionar automaticamente as variáveis mais relevantes através da penalização L1, reduzindo o risco de sobreajuste. Foi utilizada validação cruzada para escolher o valor ótimo de lambda.
+
+```{r}
+# Criar matrizes de preditores (x) e vetor de resposta (y) para treino e teste
+# model.matrix transforma variáveis categóricas em dummies (one-hot encoding)
+x_treino <- model.matrix(STATUS_BIN ~ ., data = dados_treino_model)[, -1]
+y_treino <- dados_treino_model$STATUS_BIN
+
+x_teste  <- model.matrix(STATUS_BIN ~ ., data = dados_teste_model)[, -1]
+y_teste  <- dados_teste_model$STATUS_BIN
+
+# Confirmar que treino e teste têm o mesmo número de colunas
+stopifnot(ncol(x_treino) == ncol(x_teste))
+
+# Ajustar modelo LASSO com validação cruzada para escolher o melhor valor de lambda
+set.seed(123)
+cv_lasso <- cv.glmnet(x_treino, y_treino, family = "binomial", alpha = 1, type.measure = "class")
+best_lambda <- cv_lasso$lambda.min  # Valor de lambda que minimiza o erro de classificação
+
+# Prever probabilidades no conjunto de teste
+pred_prob <- predict(cv_lasso, newx = x_teste, s = best_lambda, type = "response")
+
+# Converter probabilidades em classes (limiar 0.5)
+pred_class <- ifelse(pred_prob >= 0.5, 1, 0)
+
+# Avaliação do desempenho
+matriz_confusao <- table(Previsão = pred_class, Real = y_teste)
+accuracy <- mean(pred_class == y_teste)
+
+# Calcular a curva ROC para o modelo LASSO
+roc_lasso <- roc(y_teste, pred_prob)
+
+# Calcular a AUC para o modelo LASSO
+auc_lasso <- auc(roc_lasso)
+
+
+# Mostrar resultados
+print(matriz_confusao)
+print(paste("Precisão:", round(accuracy, 4)))
+cat("\nRegressao Logistica LASSO AUC:", round(auc_lasso, 4), "\n") # Imprimir a AUC do LASSO
+print(coef(cv_lasso, s = best_lambda))  # Coeficientes das variáveis selecionadas
+plot(cv_lasso)  # Curva de validação cruzada
+```
+
+### 4.1.3. Análise univariada com AUC para seleção inicial
+
+Foi realizada regressão logística simples para cada variável candidata. A escolha baseou-se na AUC (Área sob a Curva ROC), permitindo identificar as mais promissoras.
+
+```{r}
+# Lista de variáveis candidatas à modelação univariada
+variaveis <- c("CUMULATIVE_TREATMENT_REGIMEN_COUNT", 
+               "AGE_AT_PROCUREMENT", 
+               "SOMATIC_STATUS", 
+               "MDS_TWO_MONTHS_PRIOR_AML")
+
+# Inicializar vetor de resultados
+resultados_auc <- c()
+
+# Loop de modelagem univariada
+for (var in variaveis) {
+  
+  # Verifica se a variável existe nas duas bases
+  if (!(var %in% names(dados_treino)) || !(var %in% names(dados_teste))) {
+    warning(paste("Variável não encontrada:", var))
+    next
+  }
+  
+  # Ajusta modelo
+  formula_str <- as.formula(paste("STATUS_BIN ~", var))
+  modelo <- glm(formula_str, data = dados_treino, family = "binomial")
+  
+  # Previsão e cálculo do AUC
+  prob <- predict(modelo, newdata = dados_teste, type = "response")
+  roc_obj <- roc(dados_teste$STATUS_BIN, prob)
+  resultados_auc[var] <- auc(roc_obj)
+}
+
+# Mostrar os AUCs ordenados
+print(sort(resultados_auc, decreasing = TRUE))
+
+```
+
+### 4.1.4. Modelo Simples com AGE\_AT\_PROCUREMENT**
+
+A variável "AGE_AT_PROCUREMENT" destacou-se pela sua significância e desempenho preditivo.
+
+```{r}
+# Ajustar modelo com uma única variável (idade)
+modelo_idade <- glm(STATUS_BIN ~ AGE_AT_PROCUREMENT, data = dados_treino, family = "binomial")
+
+# Resumo do modelo com coeficientes, erro padrão e p-valores
+summary(modelo_idade)
+
+# Previsões no conjunto de teste
+prob_idade <- predict(modelo_idade, newdata = dados_teste, type = "response")
+classe_pred <- ifelse(prob_idade >= 0.5, 1, 0)
+
+# Avaliação
+matriz_confusao <- table(Predito = classe_pred, Real = dados_teste$STATUS_BIN)
+accuracy_simp <- mean(classe_pred == dados_teste$STATUS_BIN)
+
+print(matriz_confusao)
+print(paste("Precisão:", round(accuracy_simp, 4)))
+
+# Curva ROC e AUC
+roc_idade <- roc(dados_teste$STATUS_BIN, prob_idade)
+plot(roc_idade, main = "Curva ROC - AGE_AT_PROCUREMENT", col = "blue", lwd = 2)
+auc_valor <- auc(roc_idade)
+print(paste("AUC:", round(auc_valor, 4)))
+```
+
+### 4.1.5. Discussão do modelo multivariado
+
+As variáveis incluídas no modelo de regressão logística multivariada foram selecionadas com base na sua relevância estatística e clínica. A variável **AGE\_AT\_PROCUREMENT**, que representa a idade do paciente no momento da colheita, revelou-se estatisticamente significativa no modelo multivariado, com um coeficiente positivo e um valor de p inferior a 0.001. Do ponto de vista clínico, a idade é amplamente reconhecida como um fator prognóstico importante em doentes com Leucemia Mieloide Aguda (LMA). Pacientes mais idosos tendem a ter menor tolerância a tratamentos intensivos e a apresentar piores desfechos clínicos, o que justifica plenamente a inclusão desta variável no modelo.
+
+
+Por fim, a variável **CUMULATIVE\_TREATMENT\_REGIMEN\_COUNT**, que corresponde ao número acumulado de esquemas terapêuticos administrados ao paciente, demonstrou um coeficiente positivo estatisticamente significativo (valor de p aproximado de 0.0026), tanto no modelo multivariado como na seleção por stepwise. Este número reflete indiretamente a complexidade do tratamento e a gravidade do caso, sugerindo resistência terapêutica, doença refratária ou recorrente, ou ainda uma maior toxicidade acumulada. Todos estes fatores estão associados a um pior prognóstico em doentes com LMA.
+
+Em conjunto, estas três variáveis foram selecionadas por apresentarem uma combinação equilibrada entre capacidade discriminativa, significância estatística e coerência com o conhecimento clínico atual sobre a evolução e tratamento da LMA. A sua inclusão contribui para tornar o modelo mais robusto, informativo e clinicamente interpretável.
+
+
+### 4.1.6. Regressão logística multivariada (sem penalização)
+
+Modelo com as três variáveis selecionadas: idade, presença de MDS nos 2 meses anteriores, e número cumulativo de regimes de tratamento.
+
+```{r}
+# Ajustar modelo com duas variáveis preditoras selecionadas pela AUC
+modelo_multi <- glm(STATUS_BIN ~ AGE_AT_PROCUREMENT + 
+                    CUMULATIVE_TREATMENT_REGIMEN_COUNT, 
+                    data = dados_treino, family = "binomial")
+
+# Resumo com significância estatística dos coeficientes
+summary(modelo_multi)
+
+# Previsão no teste
+prob_multi <- predict(modelo_multi, newdata = dados_teste, type = "response")
+classe_predita_multi <- ifelse(prob_multi >= 0.5, 1, 0)
+
+# Avaliação
+matriz_confusao_multi <- table(Predito = classe_predita_multi, Real = dados_teste$STATUS_BIN)
+precisao_multi <- mean(classe_predita_multi == dados_teste$STATUS_BIN)
+
+print(matriz_confusao_multi)
+print(paste("Precisão:", round(precisao_multi, 4)))
+
+# Curva ROC
+roc_multi <- roc(dados_teste$STATUS_BIN, prob_multi)
+plot(roc_multi, main = "Curva ROC - Modelo Multivariado", col = "darkgreen", lwd = 2)
+auc_multi <- auc(roc_multi)
+print(paste("AUC:", round(auc_multi, 4)))
+```
+
+### 4.1.6. Modelo com seleção stepwise
+
+A seleção stepwise (critério AIC) foi utilizada para confirmar se algum termo deveria ser removido do modelo multivariado.
+
+```{r}
+# Modelo inicial com todas as variáveis candidatas
+modelo_full <- glm(STATUS_BIN ~ AGE_AT_PROCUREMENT + 
+                   CUMULATIVE_TREATMENT_REGIMEN_COUNT, 
+                   data = dados_treino, family = "binomial")
+
+# Aplicar stepwise bidirecional com base no critério AIC
+modelo_step <- stepAIC(modelo_full, direction = "both", trace = FALSE)
+
+# Resumo do modelo final selecionado
+summary(modelo_step)
+
+# Previsões
+prob_step <- predict(modelo_step, newdata = dados_teste, type = "response")
+classe_predita_step <- ifelse(prob_step >= 0.5, 1, 0)
+
+# Avaliação
+matriz_confusao_step <- table(Predito = classe_predita_step, Real = dados_teste$STATUS_BIN)
+acuracy_step <- mean(classe_predita_step == dados_teste$STATUS_BIN)
+
+print(matriz_confusao_step)
+print(paste("Precisão:", round(acuracy_step, 4)))
+
+# Curva ROC
+roc_step <- roc(dados_teste$STATUS_BIN, prob_step)
+plot(roc_step, main = "Curva ROC - Modelo Stepwise", col = "purple", lwd = 2)
+auc_step <- auc(roc_step)
+print(paste("AUC:", round(auc_step, 4)))
+```
+
+### 4.1.7. Comparação final dos modelos de regressão
+
+```{r}
+# Criar um data.frame para comparação clara entre os modelos testados
+
+roc_lasso <- roc(y_teste, as.vector(pred_prob))
+auc_lasso <- auc(roc_lasso)
+
+
+resumo_modelos <- data.frame(
+  Modelo   = c("LASSO", "Simples (Idade)", "Multivariado", "Stepwise"),
+  Precisão = c(accuracy, accuracy_simp, precisao_multi, acuracy_step),
+  AUC      = c(auc_lasso, auc_valor, auc_multi, auc_step)
 )
-rownames(sample_info) <- colnames(count_matrix)
 
-#Remover as amostras que não têm dados de OS_STATUS
-sample_info <- na.omit(sample_info)
-count_matrix <- count_matrix[, rownames(sample_info)]
-
-# Converter condition para fator
-sample_info$condition <- factor(sample_info$condition)
-
-# Verificar os níveis do fator para confirmar a comparação
-print(levels(sample_info$condition))
+# Mostrar resultados finais
+print(resumo_modelos)
 ```
 
-## 3.4. Criação do objeto DGEList para executar a análise de expressão diferencial com edgeR
+## 4.2. Modelo 2: Random Forest
 
+### 4.2.1. Funções auxiliares para pré-processamento
 ```{r}
-# Criar o objeto DGEList
-dge <- DGEList(counts = count_matrix, group = sample_info$condition)
-
-# Filtrar genes com baixa expressão
-keep <- filterByExpr(dge)
-dge <- dge[keep, , keep.lib.sizes=FALSE]
-
-# Normalização TMM
-dge <- calcNormFactors(dge, method = "TMM")
-
-# Estimar a dispersão
-dge <- estimateDisp(dge)
-
-# Ajustar o modelo
-fit <- glmQLFit(dge)
-```
-
-Realização do teste de expressão diferencial
-```{r}
-# Comparar o segundo nível ( "LIVING") com o primeiro ("DECEASED")
-qlf <- glmQLFTest(fit)
-
-# Obtenção dos resultados
-res <- topTags(qlf, n = Inf)
-res_table <- as.data.frame(res)
-```
-
-## 3.5. Armazenmento dos resultados
-
-```{r}
-# Tabela completa de resultados
-write.csv(res_table, "differential_expression_results_edgeR.csv")
-
-# Genes diferencialmente expressos (DE) com FDR < 0.05
-de_genes <- subset(res_table, FDR < 0.05)
-write.csv(de_genes, "significant_de_genes_edgeR.csv")
-```
-
-Um número significativo de genes foi identificado como diferencialmente expresso com base em FDR < 0.05 e |logFC| > 1.
-
-Esses genes apresentam variações estatisticamente significativas entre os grupos "LIVING" e "DECEASED".
-
-## 3.6 Visualização de resultados
-
-MA-plot
-```{r}
-plotMD(qlf, main = "MA Plot - edgeR", cex = 0.5)
-abline(h = 0, col = "red", lty = 2)
-```
-A maioria dos genes permanece inalterada (logFC ~ 0), mas há uma proporção considerável de genes com expressões aumentadas ou reduzidas entre os grupos.
-Genes com logFC positivo (acima da linha) indicam maior expressão em "LIVING" comparado a "DECEASED" enquanto que genes com logFC negativo (abaixo da linha) indicam menor expressão em "LIVING" comparado a "DECEASED"
-
-
-MDS plot
-```{r}
-plotMDS(dge, col = as.numeric(sample_info$condition), labels = rownames(sample_info),
-        main = "MDS Plot - edgeR")
-legend("topright", levels(sample_info$condition), col = 1:nlevels(sample_info$condition), pch = 20)
-```
-
- BCV plot (dispersão biológica)
-```{r}
-plotBCV(dge, main = "Biological Coefficient of Variation")
-```
-
-QLF plot (dispersão ajustada)
-```{r}
-plotQLDisp(fit, main = "QLF Dispersion")
-```
-
-Heatmap
-```{r}
-if (nrow(de_genes) > 0) {
-  # Seleção dos top 50 genes diferencialmente expressos
-  num_genes <- min(50, nrow(de_genes))
-  top_genes <- rownames(de_genes)[1:num_genes]
+# Função para remover níveis dos factores no conjunto de teste
+# que não existem no conjunto de treino
+remove_niveis_novos <- function(train_df, test_df) {
+  fact_cols <- names(train_df)[sapply(train_df, is.factor)]
   
-  # Obtenção de counts normalizados para os top genes
-  logcpm <- cpm(dge, log = TRUE)
-  top_gene_expr <- logcpm[top_genes, ]
+  for (col in fact_cols) {
+    niveis_validos <- levels(train_df[[col]])
+    linhas_invalidas <- !(test_df[[col]] %in% niveis_validos)
+    
+    cat(paste0("Coluna '", col, "' tem ", sum(linhas_invalidas), " linhas com níveis inválidos.\n"))
+    
+    test_df[[col]][linhas_invalidas] <- NA
+  }
   
-  # Anotação de colunas
-  annotation_col <- data.frame(
-    Condition = sample_info$condition,
-    row.names = rownames(sample_info)
-  )
-  
-  # Criação do heatmap
-  pheatmap(top_gene_expr, cluster_rows = TRUE, cluster_cols = TRUE, 
-           annotation_col = annotation_col, show_rownames = TRUE,
-           main = "Top DE Genes - edgeR")
+  test_df_limpo <- test_df %>% na.omit()
+  return(test_df_limpo)
+}
+
+# Função para alinhar os níveis dos factores entre treino e teste
+
+alinhar_niveis <- function(treino, teste) {
+  for (col in names(treino)) {
+    if (is.factor(treino[[col]]) && col %in% names(teste)) {
+      niveis_treino <- levels(treino[[col]])
+      teste[[col]] <- factor(teste[[col]], levels = niveis_treino)
+}
+
+}
+
+return(teste)
+
 }
 ```
 
-Volcano plot
+
+### 4.2.2. Treino do modelo
 ```{r}
-volcano_data <- res_table
-volcano_data$gene <- rownames(volcano_data)
-volcano_data$significant <- ifelse(volcano_data$FDR < 0.05 & abs(volcano_data$logFC) > 1, 
-                                   "DE", "Not DE")
+# Preparar dados de treino para Random Forest obrigando à utilização do dplyr
+dados_treino_rf <- dados_treino %>%
+  dplyr::select(-PATIENT_ID, -SAMPLE_ID, -OS_STATUS, -OS_MONTHS) %>%
+  dplyr::mutate(STATUS_BIN = factor(STATUS_BIN, levels = c(0, 1))) %>%
+  dplyr::mutate(across(where(is.character), as.factor)) %>%
+  dplyr::mutate(across(where(is.factor), droplevels))
 
-ggplot(volcano_data, aes(x = logFC, y = -log10(FDR), color = significant)) +
-  geom_point(alpha = 0.6) +
-  scale_color_manual(values = c("DE" = "red", "Not DE" = "black")) +
-  theme_minimal() +
-  labs(title = "Volcano Plot - edgeR", 
-       x = "log2 Fold Change", 
-       y = "-log10 FDR") +
-  theme(legend.title = element_blank())
+# Criar modelo Random Forest com validação cruzada (5-fold)
+set.seed(123)
+rf_model <- train(
+  STATUS_BIN ~ ., 
+  data = dados_treino_rf,
+  method = "rf",
+  importance = TRUE,
+  trControl = trainControl(method = "cv", number = 5)
+)
+
+# Avaliar importância das variáveis no modelo Random Forest
+rf_importance <- varImp(rf_model, scale = FALSE)
+
+# Calcular a média da importância entre as classes 0 e 1 para cada variável
+important_vars_rf <- rf_importance$importance %>%
+  mutate(Media = rowMeans(across(c("0", "1")))) %>%
+  arrange(desc(Media))
+
+# Visualizar tabela ordenada das variáveis mais importantes
+print(important_vars_rf)
+
+# Gráfico das 20 variáveis mais importantes (com base na média das importâncias)
+top_vars <- head(important_vars_rf, 20)
+barplot(
+  top_vars$Media,
+  names.arg = rownames(top_vars),
+  las = 2,
+  col = "steelblue",
+  main = "Top 20 variáveis importantes - Random Forest",
+  cex.names = 0.7
+)
 ```
 
-## 3.7. Resumo da análise
+
+### 4.2.3. Preparação dos dados de teste
+```{r}
+
+# Preparar dados de teste para Random Forest forçando o uso do dplyr
+dados_teste_rf <- dados_teste %>%
+  dplyr::select(-PATIENT_ID, -SAMPLE_ID, -OS_STATUS, -OS_MONTHS) %>%
+  dplyr::mutate(STATUS_BIN = factor(STATUS_BIN, levels = c(0, 1))) %>%
+  dplyr::mutate(across(where(is.character), as.factor)) %>%
+  dplyr::mutate(across(where(is.factor), droplevels))
+
+# Alinhar níveis dos fatores entre treino e teste
+dados_teste_rf <- alinhar_niveis(dados_treino_rf, dados_teste_rf)
+
+# Separar a variável resposta antes da limpeza
+resposta_teste <- dados_teste_rf$STATUS_BIN
+
+# Remover níveis novos nos preditores do teste 
+dados_teste_rf_clean <- remove_niveis_novos(
+  dplyr::select(dados_treino_rf, -STATUS_BIN),
+  dplyr::select(dados_teste_rf, -STATUS_BIN)
+)
+
+# Os índices numéricos das rownames garantem que associamos corretamente cada valor de STATUS_BIN às linhas restantes após a limpeza
+
+dados_teste_rf <- dados_teste_rf_clean %>%
+  mutate(STATUS_BIN = resposta_teste[as.numeric(rownames(dados_teste_rf_clean))])
+```
+
+
+
+### 4.2.4. Avaliação de Desempenho do Modelo
+#### 4.2.4.1. Matriz de Confusão
+```{r}
+# Prever classes com o modelo Random Forest
+previsoes <- predict(rf_model, newdata = dados_teste_rf)
+
+# Garantir que ambas as variáveis estão como factor com os mesmos níveis
+previsoes <- factor(previsoes, levels = c(0, 1))
+dados_teste_rf$STATUS_BIN <- factor(dados_teste_rf$STATUS_BIN, levels = c(0, 1))
+
+# Avaliar o desempenho do modelo Random Forest no conjunto de teste
+confusionMatrix(previsoes, dados_teste_rf$STATUS_BIN, positive = "1")
+```
+
+
+#### 4.2.4.2. Curva ROC e AUC - Random Forest
+```{r}
+# Prever probabilidades da classe positiva (STATUS_BIN = 1, assumindo que representa "DECEASED")
+rf_probs <- predict(rf_model, newdata = dados_teste_rf, type = "prob")[, "1"]
+
+# Calcular a curva ROC
+rf_roc <- roc(dados_teste_rf$STATUS_BIN, rf_probs)
+
+# Calcular a AUC
+rf_auc <- auc(rf_roc)
+
+# Imprimir a AUC
+cat("\nRandom Forest AUC:", round(rf_auc, 4), "\n")
+
+# Plot da curva ROC do Random Forest
+plot(rf_roc, col = "red", lwd = 2, main = "Curva ROC - Random Forest")
+```
+
+
+## 4.3. Modelo 3: SVM
+
+### 4.3.1. Preparação dos dados para SVM
+```{r}
+# Preparar dados de treino para SVM forçando dplyr
+dados_treino_svm <- dados_treino %>%
+  dplyr::select(-PATIENT_ID, -SAMPLE_ID, -OS_STATUS, -OS_MONTHS) %>%
+  dplyr::mutate(STATUS_BIN = factor(STATUS_BIN))
+
+# Preparar dados de teste para SVM (mantendo as mesmas colunas do treino)
+dados_teste_svm <- dados_teste %>%
+  dplyr::select(dplyr::any_of(names(dados_treino_svm))) %>% # Seleciona apenas colunas presentes no treino
+  dplyr::mutate(STATUS_BIN = factor(STATUS_BIN, levels = levels(dados_treino_svm$STATUS_BIN)))
+```
+
+
+### 4.3.2. Treino do modelo SVM (Kernel Linear)
+```{r}
+# Treinar modelo SVM com kernel linear
+set.seed(123)
+svm_model_linear <- svm(STATUS_BIN ~ .,
+                         data = dados_treino_svm,
+                         kernel = "linear",
+                         probability = TRUE) # Ativa o cálculo de probabilidades
+```
+
+### 4.3.3. Previsões com modelo SVM (Kernel Linear)
+```{r}
+# Fazer previsões de classe no conjunto de teste
+previsoes_svm_classe <- predict(svm_model_linear, newdata = dados_teste_svm)
+
+# Fazer previsões de probabilidade no conjunto de teste
+previsoes_svm_prob <- predict(svm_model_linear, newdata = dados_teste_svm, probability = TRUE)
+prob_svm <- attr(previsoes_svm_prob, "probabilities")[, "1"] # Probabilidade da classe '1' (DECEASED)
+
+```
+
+### 4.3.4. Avaliação do desempenho do modelo SVM (Kernel Linear)
+```{r}
+# Matriz de Confusão
+matriz_confusao_svm <- table(Previsto = previsoes_svm_classe, Real = dados_teste_svm$STATUS_BIN)
+print("Matriz de Confusão (SVM Linear):")
+print(matriz_confusao_svm)
+
+# Precisão
+precisao_svm <- mean(previsoes_svm_classe == dados_teste_svm$STATUS_BIN)
+print(paste("Precisão (SVM Linear):", round(precisao_svm, 4)))
+
+# Curva ROC e AUC
+roc_svm <- roc(dados_teste_svm$STATUS_BIN, prob_svm)
+auc_svm <- auc(roc_svm)
+cat("\nSVM Linear AUC:", round(auc_svm, 4), "\n")
+
+# Plot da curva ROC do SVM Linear
+plot(roc_svm, col = "purple", lwd = 2, main = "Curva ROC - SVM (Kernel Linear)")
+```
+
+# 5. Clustering de Amostras
+```{r}
+# Remover colunas de ID
+dados_sem_id <- dados %>%
+  dplyr::select(-PATIENT_ID, -SAMPLE_ID)
+
+# Selecionar apenas as colunas numéricas para o clustering
+dados_numerico <- dados_sem_id %>%
+  select_if(is.numeric)
+
+# Remover linhas com quaisquer valores ausentes nas colunas numéricas selecionadas
+dados_clustering <- na.omit(dados_numerico)
+
+# Escalar os dados
+dados_clustering_scaled <- scale(dados_clustering)
+
+# Calcular a matriz de distância Euclidiana
+distancia_samples <- dist(dados_clustering_scaled, method = "euclidean")
+
+# Realizar o clustering hierárquico usando o método "complete linkage"
+cluster_samples <- hclust(distancia_samples, method = "complete")
+
+# Visualizar o dendrograma de amostras
+plot(cluster_samples, main = "Dendrograma de Clustering de Amostras")
+```
+
+# 6. Redução de Dimensionalidade
+
+## 6.1. PCA
 
 ```{r}
-summary(decideTests(qlf))
+# Selecionar apenas as colunas numéricas relevantes para PCA
+dados_pca <- dados %>%
+  dplyr::select_if(is.numeric) %>%
+  dplyr::select(-STATUS_BIN) %>%
+  dplyr::select(where(~ sd(.) > 0))
+
+# Remover linhas com valores ausentes
+dados_pca_clean <- na.omit(dados_pca)
+
+pca_res <- prcomp(dados_pca_clean, scale. = TRUE)
+summary(pca_res)
+
+# Visualizaão grafica de PCA (2 primeiros componentes principais)
+pca_data <- as.data.frame(pca_res$x)
+ggplot(pca_data, aes(PC1, PC2)) +
+  geom_point(aes(color = dados$OS_STATUS)) + # Usar 'dados$OS_STATUS' para colorir
+  ggtitle("PCA - Analise de Componentes Principais")
 ```
 
-
-# 4. Análise de enriquecimento
-
-## 4.1. Preparação dos dados
-
+## 6.2. t-SNE
 ```{r}
-# Adicionar nomes de genes aos resultados
-gene_symbols <- mapIds(org.Hs.eg.db,
-                       keys = rownames(res_table),
-                       column = "SYMBOL",
-                       keytype = "ENSEMBL",
-                       multiVals = "first")
+# t-SNE para redução de dimensionalidade
+# Selecionar apenas as colunas numéricas relevantes para t-SNE
+dados_tsne <- dados %>%
+  dplyr::select_if(is.numeric) %>%
+  dplyr::select(-STATUS_BIN) 
 
-res_table$gene_name <- gene_symbols
+# Remover linhas com valores ausentes 
+dados_tsne_clean <- na.omit(dados_tsne)
 
-# Ordenar os resultados pela alteração na expressão (logFC)
-results_ord <- res_table[order(-res_table$logFC), ]
-
-# Preparar rankings para FGSEA
-ranks <- results_ord$logFC
-names(ranks) <- results_ord$gene_name
-
-# Remover genes duplicados e NA
-ranks <- ranks[!is.na(names(ranks))]
-ranks <- ranks[!duplicated(names(ranks))]
+tsne_res <- Rtsne(dados_tsne_clean, dims = 2, perplexity = 14, verbose = TRUE, max_iter = 500)
+tsne_data <- as.data.frame(tsne_res$Y)
+ggplot(tsne_data, aes(V1, V2)) +
+  geom_point(aes(color = dados$OS_STATUS)) + # Usar 'dados$OS_STATUS' para colorir
+  ggtitle("t-SNE - Reducao de Dimensionalidade")
 ```
 
-## 4.2. Carregar os conjuntos de genes
 
+## 6.3. MDS
 ```{r}
-# Fazer o download dos genes Hallmark 
+# Selecionar apenas as colunas numéricas relevantes para calcular a dissimilaridade
+dados_mds <- dados %>%
+  dplyr::select_if(is.numeric) %>%
+  dplyr::select(-STATUS_BIN) 
 
-#download.file("https://data.broadinstitute.org/gsea-msigdb/msigdb/release/7.5.1/h.all.v7.5.1.symbols.gmt")
+# Remover linhas com valores ausentes
+dados_mds_clean <- na.omit(dados_mds)
 
-# Carregar os pathways
-pathways <- gmtPathways("h.all.v7.5.1.symbols.gmt")
+# Calcular a matriz de dissimilaridade (usando distância Euclidiana nos dados escalados)
+dist_mds <- dist(scale(dados_mds_clean), method = "euclidean")
+
+mds_res <- cmdscale(dist_mds, k = 2)
+mds_data <- as.data.frame(mds_res)
+colnames(mds_data) <- c("V1", "V2")
+ggplot(mds_data, aes(V1, V2)) +
+  geom_point(aes(color = dados$OS_STATUS)) + # Usar 'dados$OS_STATUS' para colorir
+  ggtitle("MDS - Escalonamento Multidimensional")
 ```
 
-## 4.3. Executar Análise FGSEA
+# 7. Discussão
 
-```{r}
-fgseaRes <- fgsea(pathways = pathways, 
-                  stats = ranks,
-                  minSize = 15,
-                  maxSize = 500,
-                  nproc = 4)
+A análise preditiva para o status vital dos pacientes foi realizada utilizando regressão logística e Random Forest, com base em variáveis clínicas como idade, sexo e etnia. A regressão logística apresentou um desempenho ligeiramente superior (AUC ≈ 0.73), enquanto o Random Forest obteve uma AUC ligeiramente inferior (≈ 0.69). Esse desempenho da regressão logística pode estar relacionado à simplicidade dos dados e à ausência de interações complexas entre as variáveis, favorecendo modelos lineares.
 
-# Ordenar resultados por p-value ajustado
-fgseaRes <- fgseaRes[order(padj),]
+Por outro lado, ao utilizar os dados moleculares das amostras, o modelo Random Forest mostrou-se mais robusto, possivelmente por conseguir capturar interações mais complexas entre variáveis de alta dimensionalidade.
 
-# Converter o objeto fgseaRes num dataframe simples
-fgseaRes_df <- as.data.frame(fgseaRes)
+As técnicas de redução de dimensionalidade como PCA, t-SNE e MDS permitiram explorar visualmente a estrutura dos dados, revelando padrões de agrupamento entre as amostras com características clínicas ou moleculares semelhantes. No entanto, não foi realizada uma análise formal de clustering, como k-means ou agrupamento hierárquico.
 
-# Remover colunas problemáticas (como 'leadingEdge' que é uma lista)
-fgseaRes_df$leadingEdge <- NULL
-
-fgseaRes_df$leadingEdge <- sapply(fgseaRes$leadingEdge, function(x) paste(x, collapse = ","))
-
-# Guardar resultados
-write.csv(fgseaRes_df, "fgsea_results.csv", row.names = FALSE)
-```
-
-## 4.4. Resultados
-
-```{r}
-# Filtrar pathways significativos (padj < 0.05)
-sig_pathways <- fgseaRes[padj < 0.05]
-
-# Gráfico de barras para os top pathways
-if(nrow(sig_pathways) > 0) {
-  top_pathways <- head(sig_pathways[order(NES, decreasing = TRUE)], 10)
-  
-  ggplot(top_pathways, aes(x = reorder(pathway, NES), y = NES, fill = padj)) +
-    geom_bar(stat = "identity") +
-    coord_flip() +
-    labs(x = "Pathway", y = "Normalized Enrichment Score",
-         title = "Top Pathways Enriched") +
-    theme_minimal()
-  
-  ggsave("top_pathways.png", width = 10, height = 6)
-}
-
-# Certificar que fgseaRes é um dataframe
-fgseaRes_df <- as.data.frame(fgseaRes)
-```
+No geral, os resultados sugerem que diferentes fontes de dados (clínicos vs. moleculares) exigem abordagens distintas para modelagem preditiva, e que a complexidade dos dados deve guiar a escolha do modelo.
 
 
-```{r, fig.cap="Gráfico de barras para os top pathways", out.width="70%"}
-knitr::include_graphics("C:\\Users\\joama\\OneDrive\\Ambiente de Trabalho\\Extração\\Trabalho\\R_scripts\\top_pathways.png")
-```
-
-Criação do volcano plot 
-
-```{r}
-ggplot(data = fgseaRes_df,  
-       aes(x = NES, 
-           y = -log10(padj), 
-           color = padj < 0.05)) +  
-  geom_point() +  
-  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +  # Linha de corte
-  theme_minimal() +
-  labs(title = "Pathway Enrichment Analysis",
-       x = "Normalized Enrichment Score (NES)",
-       y = "-log10(adjusted p-value)",
-       color = "Significant (FDR < 0.05)") +
-  scale_color_manual(values = c("FALSE" = "gray", "TRUE" = "red"))
-```
-
-# 13. Bibliografia
+# 8. Bibliografia
